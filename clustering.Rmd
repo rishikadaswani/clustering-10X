@@ -1,0 +1,155 @@
+---
+title: "Clustering_Analysis"
+output:
+  html_document: default
+  pdf_document: default
+date: "2023-08-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#Load Libraries 
+library(dplyr)
+library(Seurat)
+library(SeuratObject)
+library(patchwork)
+library(hdf5r)
+```
+
+```{r}
+#Load the RNA Dataset
+#counts 
+r3counts <- Read10X_h5("~/Desktop/Graduate/Thesis/filtered_feature_bc_matrix.h5")
+r4counts <- Read10X_h5("~/Desktop/Graduate/Thesis/filtered_feature_bc_matrix_R4.h5")
+r15counts <- Read10X_h5("~/Desktop/Graduate/Thesis/filtered_feature_bc_matrix_R15.h5")
+r16counts <- Read10X_h5("~/Desktop/Graduate/Thesis/filtered_feature_bc_matrix_R16.h5")
+```
+
+```{r}
+#creating Seurat objects for the RNA data 
+r3_RNA <- CreateSeuratObject(counts = r3counts$`Gene Expression`, assay = "RNA")
+r4_RNA <- CreateSeuratObject(counts = r4counts$`Gene Expression`, assay = "RNA")
+r15_RNA <- CreateSeuratObject(counts = r15counts$`Gene Expression`, assay = "RNA")
+r16_RNA <- CreateSeuratObject(counts = r16counts$`Gene Expression`, assay = "RNA")
+Idents(r3_RNA) <- "r3"
+Idents(r4_RNA) <- "r4"
+Idents(r15_RNA) <- "r15"
+Idents(r16_RNA) <- "r16"
+```
+
+```{r}
+#Merging the Seurat objects 
+
+RNA_merged_data <- merge(r3_RNA, y = c(r4_RNA, r15_RNA, r16_RNA), add.cell.ids = c("r3", "r4", "r15", "r16"), project = "RNA")
+RNA_merged_data
+```
+
+
+
+```{r}
+#QC and selecting cells for further analysis 
+RNA_merged_data[["percent.mt"]] <- PercentageFeatureSet(RNA_merged_data, pattern = "^Mt-")
+#Visualize QC metrics in Violin plot 
+VlnPlot(RNA_merged_data, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+RNA_merged_data <- subset(RNA_merged_data, subset = nFeature_RNA > 100 & nFeature_RNA < 7500 & percent.mt < 10)
+
+```
+
+
+```{r}
+#Normalizing the Data 
+RNA_merged_data <- NormalizeData(RNA_merged_data, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+```{r}
+#Identification of highly variable features
+RNA_merged_data <- FindVariableFeatures(RNA_merged_data, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(RNA_merged_data), 10)
+plot1 <- VariableFeaturePlot(RNA_merged_data)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+
+```
+
+
+```{r}
+#Scaling the Data
+RNA_merged_data <- ScaleData(RNA_merged_data)
+#Variance stablization and Transformation
+DefaultAssay(RNA_merged_data) <- "RNA"
+RNA_merged_data <- SCTransform(RNA_merged_data)
+```
+
+```{r}
+#Performing PCA on the scaled dataset 
+RNA_merged_data <- RunPCA(RNA_merged_data)
+
+# Examine and visualize PCA results a few different ways
+print(RNA_merged_data[["pca"]], dims = 1:5, nfeatures = 5)
+
+VizDimLoadings(RNA_merged_data, dims = 1:2, reduction = "pca")
+DimPlot(RNA_merged_data, reduction = "pca")
+ElbowPlot(RNA_merged_data)
+```
+
+```{r}
+#Cluster the Cells 
+RNA_merged_data <- FindNeighbors(RNA_merged_data, dims = 1:5)
+RNA_merged_data <- FindClusters(RNA_merged_data, resolution = 0.5)
+
+```
+
+```{r}
+#Run non-linear dimensional reduction (UMAP/tSNE)
+#(reticulate::py_install(packages = 'umap-learn')
+RNA_merged_data <- RunUMAP(RNA_merged_data, dims = 1:5)
+DimPlot(RNA_merged_data, reduction = "umap", label = TRUE, group.by = 'seurat_clusters')
+```
+
+```{r}
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+# DB file
+db_ = '~/Desktop/clustering-10X/ScTypeDB_full.xlsx';
+tissue = "Brain" # e.g. Immune system,Pancreas,Liver,Eye,Kidney,Brain,Lung,Adrenal,Heart,Intestine,Muscle,Placenta,Spleen,Stomach,Thymus 
+
+# prepare gene sets
+gs_list = gene_sets_prepare(db_, tissue)
+
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = RNA_merged_data[["SCT"]]@scale.data, scaled = TRUE, 
+                      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative) 
+
+# NOTE: scRNAseqData parameter should correspond to your input scRNA-seq matrix. 
+# In case Seurat is used, it is either pbmc[["RNA"]]@scale.data (default), pbmc[["SCT"]]@scale.data, in case sctransform is used for normalization,
+# or pbmc[["integrated"]]@scale.data, in case a joint analysis of multiple single-cell datasets is performed.
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(RNA_merged_data@meta.data$seurat_clusters), function(cl){
+  es.max.cl = sort(rowSums(es.max[ ,rownames(RNA_merged_data@meta.data[RNA_merged_data@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+  head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(RNA_merged_data@meta.data$seurat_clusters==cl)), 10)
+}))
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+print(sctype_scores[,1:3])
+
+RNA_merged_data@meta.data$customclassif = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  RNA_merged_data@meta.data$customclassif[RNA_merged_data@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+DimPlot(RNA_merged_data, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif')        
+
+```
+
+
